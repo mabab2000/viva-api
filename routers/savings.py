@@ -1,0 +1,338 @@
+from fastapi import APIRouter, HTTPException, status, Depends
+from sqlalchemy.orm import Session
+import logging
+import traceback
+import uuid
+
+from models import User, Saving, Distribution, Penalty, PayLoanUsingSaving
+from schemas import SavingCreate, SavingResponse, SavingSummary, SavingUpdate
+from fastapi import Body
+import datetime
+from database import get_db
+from fcm_utils import send_saving_notification
+from sms_utils import send_saving_sms_notification
+
+router = APIRouter()
+logger = logging.getLogger(__name__)
+
+def calculate_user_savings_summary(db: Session, user_id: uuid.UUID) -> tuple[float, float]:
+    """
+    Calculate total and actual savings for a user
+    
+    Args:
+        db: Database session
+        user_id: User UUID
+        
+    Returns:
+        Tuple of (total_savings, actual_savings)
+    """
+    # Calculate total savings
+    total_savings_records = db.query(Saving).filter(Saving.user_id == user_id).all()
+    total_savings = sum(saving.amount for saving in total_savings_records)
+    
+    # Calculate deductions
+    distributions = db.query(Distribution).filter(Distribution.user_id == user_id).all()
+    total_distributions = sum(dist.amount for dist in distributions)
+    
+    penalties = db.query(Penalty).filter(Penalty.user_id == user_id).all()
+    total_penalties = sum(penalty.amount for penalty in penalties)
+    
+    loan_payments = db.query(PayLoanUsingSaving).filter(PayLoanUsingSaving.user_id == user_id).all()
+    total_loan_payments = sum(payment.amount for payment in loan_payments)
+    
+    # Calculate actual savings (total - all deductions)
+    actual_savings = total_savings - total_distributions - total_penalties - total_loan_payments
+    
+    logger.info(f"User {user_id} - Total: {total_savings}, Distributions: {total_distributions}, "
+               f"Penalties: {total_penalties}, Loan payments: {total_loan_payments}, "
+               f"Actual: {actual_savings}")
+    
+    return total_savings, actual_savings
+
+@router.post("/saving", response_model=SavingResponse)
+async def create_saving(saving_data: SavingCreate, db: Session = Depends(get_db)):
+    """
+    Create a new saving entry
+    """
+    try:
+        logger.info(f"Creating saving for user_id: {saving_data.user_id}, amount: {saving_data.amount}")
+        
+        # Verify user exists
+        try:
+            user_uuid = uuid.UUID(saving_data.user_id)
+        except ValueError:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid user ID format"
+            )
+        
+        user = db.query(User).filter(User.id == user_uuid).first()
+        if not user:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="User not found"
+            )
+        
+        # Create new saving with custom date
+        db_saving = Saving(
+            user_id=user_uuid,
+            amount=saving_data.amount,
+            created_at=saving_data.date
+        )
+        
+        db.add(db_saving)
+        db.commit()
+        db.refresh(db_saving)
+        
+        # Send FCM notification if user has FCM token
+        if user.fcm_token:
+            try:
+                notification_sent = await send_saving_notification(
+                    fcm_token=user.fcm_token,
+                    amount=db_saving.amount,
+                    username=user.username,
+                    saving_date=db_saving.created_at.isoformat()
+                )
+                if notification_sent:
+                    logger.info(f"FCM notification sent successfully for saving: {db_saving.id}")
+                else:
+                    logger.warning(f"FCM notification failed for saving: {db_saving.id}")
+            except Exception as e:
+                logger.warning(f"Failed to send FCM notification: {str(e)}")
+                # Don't fail the saving creation if notification fails
+        
+        # Calculate total savings and actual savings for the user (including this new saving)
+        total_savings, actual_savings = calculate_user_savings_summary(db, user_uuid)
+        
+        # Send SMS notification if user has phone number
+        if user.phone_number:
+            try:
+                sms_sent = send_saving_sms_notification(
+                    phone_number=user.phone_number,
+                    user_name=user.username or "Customer",
+                    amount=db_saving.amount,
+                    total_savings=total_savings,
+                    actual_savings=actual_savings,
+                    saving_date=db_saving.created_at
+                )
+                if sms_sent:
+                    logger.info(f"SMS notification sent successfully for saving: {db_saving.id}")
+                else:
+                    logger.warning(f"SMS notification failed for saving: {db_saving.id}")
+            except Exception as e:
+                logger.warning(f"Failed to send SMS notification: {str(e)}")
+                # Don't fail the saving creation if SMS fails
+        
+        logger.info(f"Saving created successfully: {db_saving.id}")
+        
+        return SavingResponse(
+            id=str(db_saving.id),
+            user_id=str(db_saving.user_id),
+            amount=db_saving.amount,
+            username=user.username if user else None,
+            phone_number=user.phone_number if user else None,
+            created_at=db_saving.created_at
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error creating saving: {str(e)}")
+        logger.error(traceback.format_exc())
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error creating saving: {str(e)}"
+        )
+
+@router.get("/savings/{user_id}", response_model=SavingSummary)
+async def get_user_savings(user_id: str, db: Session = Depends(get_db)):
+    """
+    Get all savings for a specific user with total amount and count
+    """
+    try:
+        logger.info(f"Fetching savings for user_id: {user_id}")
+        
+        # Verify user exists
+        try:
+            user_uuid = uuid.UUID(user_id)
+        except ValueError:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid user ID format"
+            )
+        
+        user = db.query(User).filter(User.id == user_uuid).first()
+        if not user:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="User not found"
+            )
+        
+        # Get all savings for the user, ordered by creation date (newest first)
+        savings = db.query(Saving).filter(Saving.user_id == user_uuid).order_by(Saving.created_at.desc()).all()
+        
+        # Calculate totals
+        total_amount = sum(saving.amount for saving in savings)
+        total_saving = len(savings)
+        
+        logger.info(f"Found {total_saving} savings for user: {user_id} (Total: {total_amount})")
+        
+        saving_responses = []
+        for saving in savings:
+            # try to fetch user info for this saving
+            try:
+                user_obj = db.query(User).filter(User.id == saving.user_id).first()
+                username = user_obj.username if user_obj else None
+                phone = user_obj.phone_number if user_obj else None
+            except Exception:
+                username = None
+                phone = None
+
+            saving_responses.append(
+                SavingResponse(
+                    id=str(saving.id),
+                    user_id=str(saving.user_id),
+                    amount=saving.amount,
+                    username=username,
+                    phone_number=phone,
+                    created_at=saving.created_at
+                )
+            )
+        
+        return SavingSummary(
+            total_amount=total_amount,
+            total_saving=total_saving,
+            savings=saving_responses
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching savings: {str(e)}")
+        logger.error(traceback.format_exc())
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error fetching savings: {str(e)}"
+        )
+
+
+# Admin: list all savings
+@router.get("/savings", response_model=SavingSummary)
+async def list_all_savings(db: Session = Depends(get_db)):
+    """
+    Get all savings across all users with total amount and count
+    """
+    try:
+        savings = db.query(Saving).order_by(Saving.created_at.desc()).all()
+
+        total_amount = sum(saving.amount for saving in savings)
+        total_saving = len(savings)
+
+        saving_responses = []
+        for saving in savings:
+            try:
+                user_obj = db.query(User).filter(User.id == saving.user_id).first()
+                username = user_obj.username if user_obj else None
+                phone = user_obj.phone_number if user_obj else None
+            except Exception:
+                username = None
+                phone = None
+
+            saving_responses.append(
+                SavingResponse(
+                    id=str(saving.id),
+                    user_id=str(saving.user_id),
+                    amount=saving.amount,
+                    username=username,
+                    phone_number=phone,
+                    created_at=saving.created_at
+                )
+            )
+
+        return SavingSummary(
+            total_amount=total_amount,
+            total_saving=total_saving,
+            savings=saving_responses
+        )
+    except Exception as e:
+        logger.error(f"Error listing all savings: {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+
+# Admin: update a saving record
+@router.put("/saving/{saving_id}", response_model=SavingResponse)
+async def update_saving(saving_id: str, payload: SavingUpdate = Body(...), db: Session = Depends(get_db)):
+    try:
+        try:
+            saving_uuid = uuid.UUID(saving_id)
+        except ValueError:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid saving ID format")
+
+        saving = db.query(Saving).filter(Saving.id == saving_uuid).first()
+        if not saving:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Saving not found")
+
+        if payload.amount is not None:
+            if payload.amount <= 0:
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Amount must be greater than 0")
+            saving.amount = payload.amount
+
+        # Optionally update created_at if provided in the payload
+        if getattr(payload, 'created_at', None) is not None:
+            try:
+                # payload.created_at should already be a datetime from Pydantic
+                saving.created_at = payload.created_at
+            except Exception:
+                # ignore invalid values
+                pass
+        db.commit()
+        db.refresh(saving)
+
+        # include user info
+        try:
+            user_obj = db.query(User).filter(User.id == saving.user_id).first()
+            username = user_obj.username if user_obj else None
+            phone = user_obj.phone_number if user_obj else None
+        except Exception:
+            username = None
+            phone = None
+
+        return SavingResponse(
+            id=str(saving.id),
+            user_id=str(saving.user_id),
+            amount=saving.amount,
+            username=username,
+            phone_number=phone,
+            created_at=saving.created_at,
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error updating saving: {str(e)}")
+        db.rollback()
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Error updating saving: {str(e)}")
+
+
+# Admin: delete a saving record
+@router.delete("/saving/{saving_id}")
+async def delete_saving(saving_id: str, db: Session = Depends(get_db)):
+    try:
+        try:
+            saving_uuid = uuid.UUID(saving_id)
+        except ValueError:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid saving ID format")
+
+        saving = db.query(Saving).filter(Saving.id == saving_uuid).first()
+        if not saving:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Saving not found")
+
+        db.delete(saving)
+        db.commit()
+        return {"message": "Saving deleted successfully"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error deleting saving: {str(e)}")
+        db.rollback()
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Error deleting saving: {str(e)}")

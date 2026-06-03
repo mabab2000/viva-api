@@ -1,0 +1,733 @@
+from fastapi import APIRouter, HTTPException, status, Depends, UploadFile, File, Form, WebSocket, WebSocketDisconnect
+from sqlalchemy.orm import Session
+from sqlalchemy import func
+from pathlib import Path
+import logging
+import traceback
+import uuid
+import json
+import base64
+from datetime import datetime
+
+from models import User, ProfilePhoto, Saving, Loan, LoanPayment, Distribution, PayLoanUsingSaving
+from schemas import ProfilePhotoResponse, HomeResponse, LatestSavingInfo, UserResponse, UserUpdate, MemberResponse, ProfilePhotoURLResponse, DistributionResponse, UserDistributionsResponse
+from database import get_db
+from .auth import get_password_hash
+from supabase_utils import upload_image_to_supabase, delete_image_from_supabase
+from fastapi import Body
+
+router = APIRouter()
+logger = logging.getLogger(__name__)
+
+@router.post("/profile-photo", response_model=ProfilePhotoResponse)
+async def upload_profile_photo(
+    user_id: str = Form(...),
+    photo: UploadFile = File(...),
+    db: Session = Depends(get_db)
+):
+    """
+    Upload or update profile photo for a user to Supabase storage
+    """
+    try:
+        logger.info(f"Uploading profile photo for user_id: {user_id}")
+        
+        # Verify user exists
+        try:
+            user_uuid = uuid.UUID(user_id)
+        except ValueError:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid user ID format"
+            )
+        
+        user = db.query(User).filter(User.id == user_uuid).first()
+        if not user:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="User not found"
+            )
+        
+        # Validate file type
+        allowed_extensions = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
+        file_ext = Path(photo.filename).suffix.lower()
+        
+        if file_ext not in allowed_extensions:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid file type. Allowed types: {', '.join(allowed_extensions)}"
+            )
+        
+        # Read image content
+        try:
+            contents = await photo.read()
+            content_type = photo.content_type or "image/jpeg"
+        except Exception as e:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Error reading file: {str(e)}"
+            )
+        
+        # Upload to Supabase storage (folder: saving-image)
+        try:
+            photo_url = upload_image_to_supabase(
+                file_content=contents,
+                filename=photo.filename,
+                folder="saving-image"
+            )
+        except Exception as e:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Error uploading to Supabase: {str(e)}"
+            )
+        
+        # Check if profile photo already exists for this user
+        existing_photo = db.query(ProfilePhoto).filter(ProfilePhoto.user_id == user_uuid).first()
+        
+        if existing_photo:
+            # Delete old image from Supabase if exists
+            if existing_photo.photo_url:
+                delete_image_from_supabase(existing_photo.photo_url)
+            
+            # Update existing photo with new Supabase URL
+            existing_photo.photo_url = photo_url
+            existing_photo.content_type = content_type
+            existing_photo.updated_at = datetime.utcnow()
+            db.commit()
+            db.refresh(existing_photo)
+            
+            logger.info(f"Profile photo updated successfully: {existing_photo.id}")
+            
+            return ProfilePhotoResponse(
+                id=str(existing_photo.id),
+                user_id=str(existing_photo.user_id),
+                photo=existing_photo.photo_url,
+                created_at=existing_photo.created_at,
+                updated_at=existing_photo.updated_at
+            )
+        else:
+            # Create new profile photo entry
+            db_photo = ProfilePhoto(
+                user_id=user_uuid,
+                photo_url=photo_url,
+                content_type=content_type
+            )
+            # Create new profile photo entry
+            db_photo = ProfilePhoto(
+                user_id=user_uuid,
+                photo_url=photo_url,
+                content_type=content_type
+            )
+            
+            db.add(db_photo)
+            db.commit()
+            db.refresh(db_photo)
+            
+            logger.info(f"Profile photo uploaded successfully: {db_photo.id}")
+            
+            return ProfilePhotoResponse(
+                id=str(db_photo.id),
+                user_id=str(db_photo.user_id),
+                photo=db_photo.photo_url,
+                created_at=db_photo.created_at,
+                updated_at=db_photo.updated_at
+            )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error uploading profile photo: {str(e)}")
+        logger.error(traceback.format_exc())
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error uploading profile photo: {str(e)}"
+        )
+
+# Get profile photo URL by user_id
+@router.get("/profile-photo/{user_id}", response_model=ProfilePhotoURLResponse)
+async def get_profile_photo(user_id: str, db: Session = Depends(get_db)):
+    """
+    Get profile photo URL for a user
+    """
+    try:
+        logger.info(f"Fetching profile photo for user_id: {user_id}")
+        
+        # Verify user ID format
+        try:
+            user_uuid = uuid.UUID(user_id)
+        except ValueError:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid user ID format"
+            )
+        
+        # Verify user exists
+        user = db.query(User).filter(User.id == user_uuid).first()
+        if not user:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="User not found"
+            )
+        
+        # Get profile photo
+        profile_photo = db.query(ProfilePhoto).filter(ProfilePhoto.user_id == user_uuid).first()
+        
+        if profile_photo:
+            try:
+                # Return Supabase URL
+                logger.info(f"Profile photo found for user {user_id}")
+                
+                return ProfilePhotoURLResponse(
+                    image_preview_link=profile_photo.photo_url
+                )
+            except Exception as e:
+                logger.error(f"Error retrieving profile photo: {str(e)}")
+                return ProfilePhotoURLResponse(
+                    image_preview_link=None
+                )
+        else:
+            logger.info(f"No profile photo found for user {user_id}")
+            return ProfilePhotoURLResponse(
+                image_preview_link=None
+            )
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching profile photo: {str(e)}")
+        logger.error(traceback.format_exc())
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error fetching profile photo: {str(e)}"
+        )
+
+# Get user profile by user_id
+@router.get("/profile/{user_id}", response_model=UserResponse)
+async def get_user_profile(user_id: str, db: Session = Depends(get_db)):
+    """
+    Get user profile information by user_id
+    """
+    try:
+        logger.info(f"Fetching profile for user_id: {user_id}")
+        
+        # Verify user ID format
+        try:
+            user_uuid = uuid.UUID(user_id)
+        except ValueError:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid user ID format"
+            )
+        
+        # Get user from database
+        user = db.query(User).filter(User.id == user_uuid).first()
+        if not user:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="User not found"
+            )
+        
+        # Calculate total savings
+        total_saving = db.query(func.coalesce(func.sum(Saving.amount), 0)).filter(
+            Saving.user_id == user_uuid
+        ).scalar()
+
+        # Calculate total distributions for this user
+        total_distributions = db.query(func.coalesce(func.sum(Distribution.amount), 0)).filter(
+            Distribution.user_id == user_uuid
+        ).scalar() or 0.0
+
+        # Calculate total pay-loan-using-saving for this user
+        total_payloan_using_saving = db.query(func.coalesce(func.sum(PayLoanUsingSaving.amount), 0)).filter(
+            PayLoanUsingSaving.user_id == user_uuid
+        ).scalar() or 0.0
+
+        original_saving = (total_saving or 0.0) - (total_distributions or 0.0) - (total_payloan_using_saving or 0.0)
+        
+        # Get profile photo if exists
+        profile_photo = db.query(ProfilePhoto).filter(ProfilePhoto.user_id == user_uuid).first()
+        profile_image_url = None
+        if profile_photo:
+            try:
+                profile_image_url = profile_photo.photo_url
+            except Exception as e:
+                logger.warning(f"Could not get profile photo: {e}")
+        
+        return UserResponse(
+            id=str(user.id),
+            username=user.username,
+            email=user.email,
+            phone_number=user.phone_number,
+            total_saving=total_saving,
+            original_saving=original_saving,
+            profile_image_url=profile_image_url
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching user profile: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error fetching user profile: {str(e)}"
+        )
+
+@router.websocket("/home/{user_id}")
+async def websocket_home_info(websocket: WebSocket, user_id: str, db: Session = Depends(get_db)):
+    """
+    WebSocket endpoint for real-time home dashboard information
+    - Image preview link
+    - Total saving
+    - Total loan
+    - Latest saving info (month, year, amount)
+    """
+    await websocket.accept()
+    
+    try:
+        logger.info(f"WebSocket connection established for user_id: {user_id}")
+        
+        # Verify user exists
+        try:
+            user_uuid = uuid.UUID(user_id)
+        except ValueError:
+            await websocket.send_text(json.dumps({
+                "error": "Invalid user ID format"
+            }))
+            await websocket.close()
+            return
+        
+        user = db.query(User).filter(User.id == user_uuid).first()
+        if not user:
+            await websocket.send_text(json.dumps({
+                "error": "User not found"
+            }))
+            await websocket.close()
+            return
+        
+        # Get profile photo
+        profile_photo = db.query(ProfilePhoto).filter(ProfilePhoto.user_id == user_uuid).first()
+        image_preview_link = None
+        if profile_photo:
+            try:
+                # Get Supabase URL
+                image_preview_link = profile_photo.photo_url
+            except Exception as e:
+                logger.warning(f"Could not get profile photo: {e}")
+        
+        # Calculate total savings
+        total_saving = db.query(func.coalesce(func.sum(Saving.amount), 0)).filter(Saving.user_id == user_uuid).scalar() or 0.0
+
+        # Calculate total loans (only active loans)
+        total_loan_amount = db.query(func.coalesce(func.sum(Loan.amount), 0)).filter(
+            Loan.user_id == user_uuid,
+            Loan.status == "active"
+        ).scalar() or 0.0
+
+        # Sum payments only for those active loans
+        active_loan_rows = db.query(Loan.id).filter(Loan.user_id == user_uuid, Loan.status == "active").all()
+        active_loan_ids = [row[0] for row in active_loan_rows] if active_loan_rows else []
+
+        if active_loan_ids:
+            total_loan_payments = db.query(func.coalesce(func.sum(LoanPayment.amount), 0)).filter(
+                LoanPayment.loan_id.in_(active_loan_ids)
+            ).scalar() or 0.0
+        else:
+            total_loan_payments = 0.0
+
+        # Calculate current loan (only considering active loans). If none, return 0.
+        total_loan = float(total_loan_amount) - float(total_loan_payments)
+        if total_loan < 0:
+            total_loan = 0.0
+
+        # Get latest saving info
+        latest_saving = db.query(Saving).filter(
+            Saving.user_id == user_uuid
+        ).order_by(Saving.created_at.desc()).first()
+
+        latest_saving_info = None
+        if latest_saving:
+            latest_saving_info = {
+                "month": latest_saving.created_at.month,
+                "year": latest_saving.created_at.year,
+                "amount": latest_saving.amount
+            }
+
+        # Send home data via WebSocket
+        home_data = {
+            "user_id": str(user_uuid),
+            "image_preview_link": image_preview_link,
+            "total_saving": total_saving,
+            "total_loan": total_loan,
+            "latest_saving_info": latest_saving_info
+        }
+        
+        await websocket.send_text(json.dumps(home_data))
+        
+        # Keep connection alive and listen for client messages
+        while True:
+            try:
+                # Wait for client message (for potential real-time updates)
+                data = await websocket.receive_text()
+                logger.info(f"Received WebSocket message: {data}")
+                
+                # Could implement real-time updates here
+                # For now, just echo back the current data
+                await websocket.send_text(json.dumps(home_data))
+                
+            except WebSocketDisconnect:
+                logger.info(f"WebSocket disconnected for user {user_id}")
+                break
+                
+    except Exception as e:
+        logger.error(f"Error in WebSocket home endpoint: {str(e)}")
+        try:
+            await websocket.send_text(json.dumps({
+                "error": f"Server error: {str(e)}"
+            }))
+        except:
+            pass
+        finally:
+            try:
+                await websocket.close()
+            except:
+                pass
+
+
+# HTTP endpoint: home dashboard info
+@router.get("/home/{user_id}", response_model=HomeResponse)
+async def get_home_info(user_id: str, db: Session = Depends(get_db)):
+    """
+    HTTP endpoint for home dashboard information
+    - image_preview_link
+    - total_saving
+    - total_loan (only active loans considered)
+    - latest_saving_info (month:number, year:number, amount:number)
+    """
+    try:
+        logger.info(f"Fetching home info for user_id: {user_id}")
+
+        # Verify user exists
+        try:
+            user_uuid = uuid.UUID(user_id)
+        except ValueError:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid user ID format"
+            )
+
+        user = db.query(User).filter(User.id == user_uuid).first()
+        if not user:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="User not found"
+            )
+
+        # Get profile photo
+        profile_photo = db.query(ProfilePhoto).filter(ProfilePhoto.user_id == user_uuid).first()
+        image_preview_link = None
+        if profile_photo:
+            try:
+                image_preview_link = profile_photo.photo_url
+            except Exception as e:
+                logger.warning(f"Could not get profile photo: {e}")
+
+        # Calculate total savings
+        total_saving = db.query(func.coalesce(func.sum(Saving.amount), 0)).filter(Saving.user_id == user_uuid).scalar() or 0.0
+
+        # Calculate total loans (only active loans)
+        total_loan_amount = db.query(func.coalesce(func.sum(Loan.amount), 0)).filter(
+            Loan.user_id == user_uuid,
+            Loan.status == "active"
+        ).scalar() or 0.0
+
+        # Sum payments only for those active loans
+        active_loan_rows = db.query(Loan.id).filter(Loan.user_id == user_uuid, Loan.status == "active").all()
+        active_loan_ids = [row[0] for row in active_loan_rows] if active_loan_rows else []
+
+        if active_loan_ids:
+            total_loan_payments = db.query(func.coalesce(func.sum(LoanPayment.amount), 0)).filter(
+                LoanPayment.loan_id.in_(active_loan_ids)
+            ).scalar() or 0.0
+        else:
+            total_loan_payments = 0.0
+
+        current_loan = float(total_loan_amount) - float(total_loan_payments)
+        if current_loan < 0:
+            current_loan = 0.0
+
+        # Get latest saving info
+        latest_saving = db.query(Saving).filter(
+            Saving.user_id == user_uuid
+        ).order_by(Saving.created_at.desc()).first()
+
+        latest_saving_info = None
+        if latest_saving:
+            latest_saving_info = {
+                "month": latest_saving.created_at.month,
+                "year": latest_saving.created_at.year,
+                "amount": latest_saving.amount
+            }
+
+        return HomeResponse(
+            user_id=str(user_uuid),
+            image_preview_link=image_preview_link,
+            total_saving=total_saving,
+            total_loan=current_loan,
+            latest_saving_info=latest_saving_info
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching home info: {str(e)}")
+        logger.error(traceback.format_exc())
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error fetching home info: {str(e)}"
+        )
+
+# Public/Admin: list members with basic info and profile image link
+@router.get("/members", response_model=list[MemberResponse])
+async def list_members(db: Session = Depends(get_db)):
+    try:
+        users = db.query(User).order_by(User.username.asc()).all()
+        members = []
+        for u in users:
+            # find profile photo
+            profile_photo = db.query(ProfilePhoto).filter(ProfilePhoto.user_id == u.id).first()
+            image_preview_link = None
+            if profile_photo:
+                try:
+                    image_preview_link = profile_photo.photo_url
+                except Exception:
+                    image_preview_link = None
+
+            members.append(
+                MemberResponse(
+                    id=str(u.id),
+                    username=u.username,
+                    email=u.email,
+                    phone_number=u.phone_number,
+                    image_preview_link=image_preview_link,
+                )
+            )
+
+        return members
+    except Exception as e:
+        logger.error(f"Error listing members: {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+
+@router.get("/users/{user_id}/distributions", response_model=UserDistributionsResponse)
+async def get_user_distributions_and_info(user_id: str, db: Session = Depends(get_db)):
+    """
+    Return user info and their distributions list
+    """
+    try:
+        try:
+            user_uuid = uuid.UUID(user_id)
+        except ValueError:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid user ID format")
+
+        user = db.query(User).filter(User.id == user_uuid).first()
+        if not user:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+
+        # Calculate totals for user
+        total_saving = db.query(func.coalesce(func.sum(Saving.amount), 0)).filter(Saving.user_id == user_uuid).scalar() or 0.0
+        total_distributions = db.query(func.coalesce(func.sum(Distribution.amount), 0)).filter(Distribution.user_id == user_uuid).scalar() or 0.0
+        total_payloan_using_saving = db.query(func.coalesce(func.sum(PayLoanUsingSaving.amount), 0)).filter(PayLoanUsingSaving.user_id == user_uuid).scalar() or 0.0
+        original_saving = float(total_saving) - float(total_distributions) - float(total_payloan_using_saving)
+
+        user_resp = UserResponse(
+            id=str(user.id),
+            username=user.username,
+            email=user.email,
+            phone_number=user.phone_number,
+            total_saving=float(total_saving),
+            original_saving=original_saving,
+        )
+
+        # Get distributions
+        dists = db.query(Distribution).filter(Distribution.user_id == user_uuid).order_by(Distribution.created_at.desc()).all()
+        dist_list: list[DistributionResponse] = []
+        for d in dists:
+            dist_list.append(DistributionResponse(
+                id=str(d.id),
+                user_id=str(d.user_id),
+                full_name=user.username if user else None,
+                amount=d.amount,
+                year=d.created_at.year
+            ))
+
+        return UserDistributionsResponse(user=user_resp, distributions=dist_list)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching user distributions and info: {e}")
+        logger.error(traceback.format_exc())
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+
+@router.get("/users/distributions", response_model=UserDistributionsResponse)
+async def get_user_distributions_by_identifier(username: str | None = None, phone_number: str | None = None, db: Session = Depends(get_db)):
+    """
+    Return user info and their distributions by `username` or `phone_number`.
+    Provide at least one of the query parameters.
+    """
+    try:
+        if not username and not phone_number:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Provide either username or phone_number")
+
+        user = None
+        if username:
+            user = db.query(User).filter(User.username == username).first()
+
+        if not user and phone_number:
+            user = db.query(User).filter(User.phone_number == phone_number).first()
+
+        if not user:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+
+        user_uuid = user.id
+
+        # Calculate totals for user
+        total_saving = db.query(func.coalesce(func.sum(Saving.amount), 0)).filter(Saving.user_id == user_uuid).scalar() or 0.0
+        total_distributions = db.query(func.coalesce(func.sum(Distribution.amount), 0)).filter(Distribution.user_id == user_uuid).scalar() or 0.0
+        total_payloan_using_saving = db.query(func.coalesce(func.sum(PayLoanUsingSaving.amount), 0)).filter(PayLoanUsingSaving.user_id == user_uuid).scalar() or 0.0
+        original_saving = float(total_saving) - float(total_distributions) - float(total_payloan_using_saving)
+
+        user_resp = UserResponse(
+            id=str(user.id),
+            username=user.username,
+            email=user.email,
+            phone_number=user.phone_number,
+            total_saving=float(total_saving),
+            original_saving=original_saving,
+        )
+
+        # Get distributions
+        dists = db.query(Distribution).filter(Distribution.user_id == user_uuid).order_by(Distribution.created_at.desc()).all()
+        dist_list: list[DistributionResponse] = []
+        for d in dists:
+            dist_list.append(DistributionResponse(
+                id=str(d.id),
+                user_id=str(d.user_id),
+                full_name=user.username if user else None,
+                amount=d.amount,
+                year=d.created_at.year
+            ))
+
+        return UserDistributionsResponse(user=user_resp, distributions=dist_list)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching user distributions by identifier: {e}")
+        logger.error(traceback.format_exc())
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+
+# Admin: list all users
+@router.get("/users", response_model=list[UserResponse])
+async def list_users(db: Session = Depends(get_db)):
+    try:
+        users = db.query(User).all()
+        result: list[UserResponse] = []
+        for u in users:
+            # Calculate total saving for the user
+            total_saving = db.query(func.coalesce(func.sum(Saving.amount), 0)).filter(Saving.user_id == u.id).scalar() or 0.0
+
+            total_distributions = db.query(func.coalesce(func.sum(Distribution.amount), 0)).filter(Distribution.user_id == u.id).scalar() or 0.0
+            total_payloan_using_saving = db.query(func.coalesce(func.sum(PayLoanUsingSaving.amount), 0)).filter(PayLoanUsingSaving.user_id == u.id).scalar() or 0.0
+
+            original_saving = float(total_saving) - float(total_distributions) - float(total_payloan_using_saving)
+
+            result.append(
+                UserResponse(
+                    id=str(u.id),
+                    username=u.username,
+                    email=u.email,
+                    phone_number=u.phone_number,
+                    total_saving=float(total_saving),
+                    original_saving=original_saving,
+                )
+            )
+
+        return result
+    except Exception as e:
+        logger.error(f"Error listing users: {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+
+# Admin: update a user
+@router.put("/users/{user_id}", response_model=UserResponse)
+async def update_user(user_id: str, payload: UserUpdate = Body(...), db: Session = Depends(get_db)):
+    try:
+        try:
+            user_uuid = uuid.UUID(user_id)
+        except ValueError:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid user ID format")
+
+        user = db.query(User).filter(User.id == user_uuid).first()
+        if not user:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+
+        # Check uniqueness when updating username/email/phone
+        if payload.username and payload.username != user.username:
+            existing = db.query(User).filter(User.username == payload.username).first()
+            if existing:
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Username already taken")
+            user.username = payload.username
+
+        if payload.email and payload.email != user.email:
+            existing = db.query(User).filter(User.email == payload.email).first()
+            if existing:
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Email already taken")
+            user.email = payload.email
+
+        if payload.phone_number and payload.phone_number != user.phone_number:
+            existing = db.query(User).filter(User.phone_number == payload.phone_number).first()
+            if existing:
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Phone number already taken")
+            user.phone_number = payload.phone_number
+
+        if payload.password:
+            user.hashed_password = get_password_hash(payload.password)
+
+        db.commit()
+        db.refresh(user)
+
+        return UserResponse(id=str(user.id), username=user.username, email=user.email, phone_number=user.phone_number)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error updating user: {e}")
+        db.rollback()
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+
+# Admin: delete a user
+@router.delete("/users/{user_id}")
+async def delete_user(user_id: str, db: Session = Depends(get_db)):
+    try:
+        try:
+            user_uuid = uuid.UUID(user_id)
+        except ValueError:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid user ID format")
+
+        user = db.query(User).filter(User.id == user_uuid).first()
+        if not user:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+
+        # Attempt to delete user (may fail if FK constraints exist)
+        db.delete(user)
+        db.commit()
+        return {"message": "User deleted successfully"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error deleting user: {e}")
+        db.rollback()
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))

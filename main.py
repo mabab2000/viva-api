@@ -1,0 +1,96 @@
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from dotenv import load_dotenv
+import logging
+import uvicorn
+import os
+
+# Load environment variables first
+load_dotenv()
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Import routers (after loading env vars)
+try:
+    from routers.auth import router as auth_router
+    from routers.savings import router as savings_router
+    from routers.loans import router as loans_router
+    from routers.penalties import router as penalties_router
+    from routers.users import router as users_router
+    from routers.distributions import router as distributions_router
+    from routers.pay_loan_using_saving import router as pay_loan_using_saving_router
+    from routers.dashboard import router as dashboard_router
+    from routers.stats_ws import router as stats_ws_router
+    from routers.sms_test import router as sms_test_router
+    from icon_router import router as icon_router
+    logger.info("All routers imported successfully")
+except Exception as e:
+    logger.error(f"Failed to import routers: {str(e)}")
+    raise
+
+# Create FastAPI app
+app = FastAPI(
+    title="Saving Management System API",
+    description="API for managing savings and user authentication",
+    version="1.0.0"
+)
+
+@app.on_event("startup")
+async def startup_event():
+    """Startup event to verify database connection"""
+    try:
+        from database import engine
+        # Test database connection
+        with engine.connect() as conn:
+            logger.info("Database connection verified successfully")
+    except Exception as e:
+        logger.error(f"Database connection failed during startup: {str(e)}")
+        raise
+
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allows all origins
+    allow_credentials=True,
+    allow_methods=["*"],  # Allows all methods
+    allow_headers=["*"],  # Allows all headers
+)
+
+# Include routers
+app.include_router(auth_router, prefix="/api", tags=["Authentication"])
+app.include_router(savings_router, prefix="/api", tags=["Savings"])
+app.include_router(loans_router, prefix="/api", tags=["Loans"])
+app.include_router(penalties_router, prefix="/api", tags=["Penalties"])
+app.include_router(users_router, prefix="/api", tags=["Users"])
+app.include_router(distributions_router, prefix="/api", tags=["Distributions"])
+app.include_router(pay_loan_using_saving_router, prefix="/api", tags=["PayLoanUsingSaving"])
+app.include_router(dashboard_router, prefix="/api", tags=["Dashboard"])
+app.include_router(sms_test_router, prefix="/api", tags=["SMS Test"])
+app.include_router(icon_router, prefix="/static", tags=["Static"])
+# WebSocket stats router (exposes /ws/stats)
+app.include_router(stats_ws_router)
+
+# Mount static files for app icons and assets
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
+@app.get("/")
+async def root():
+    """
+    Root endpoint - API description
+    """
+    return {
+        "message": "Saving Management System API",
+        "description": "API for managing savings Developed by BIZIYAREMYE Alphonse",
+       
+        
+    }
+
+if __name__ == "__main__":
+    # In production or CI we start the server without auto-reload to avoid
+    # multiple processes trying to bind the same port (Windows socket error 10048).
+    # For development with live-reload use the CLI: `uvicorn main:app --reload`
+    port = int(os.getenv("PORT", "8000"))
+    uvicorn.run("main:app", host="0.0.0.0", port=port)
